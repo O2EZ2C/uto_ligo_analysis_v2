@@ -1,0 +1,6 @@
+__pycache__/
+raw_csvs/
+planet_bsps/
+catalogs/
+checkpoints/
+outputs/
