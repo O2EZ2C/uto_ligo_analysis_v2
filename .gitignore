@@ -4,3 +4,5 @@ planet_bsps/
 catalogs/
 checkpoints/
 outputs/
+ligo-env/
+

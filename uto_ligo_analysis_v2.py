@@ -2,11 +2,11 @@
 UTO v2 — Skeleton (File A: offline-only)
 ==========================================
 
-STATUS: SKELETON. Every stage function below is a stub that just
-prints "not built yet, skipping". This file is meant to be built one
-stage at a time — copy real code into one stub, test it, move on.
-See v2_script_context_document.md for the full design spec this
-follows.
+STATUS: Stage 1 (load + filter) and run selection are now real. Every
+other stage function is still a stub that prints "not built yet,
+skipping". Keep building one stage at a time — copy real code into
+the next stub, test it, move on. See v2_script_context_document.md
+for the full design spec this follows.
 
 FILE SPLIT
 ----------
@@ -29,8 +29,11 @@ computer it runs on.
 
 import os
 import sys
+import re
 import pickle
 from pathlib import Path
+
+import pandas as pd
 
 # ---------------------------------------------------------------------
 # 0. FOLDERS — all relative to this script's own location.
@@ -44,6 +47,51 @@ LOG_PATH = OUTPUT_DIR / "run_log.txt"
 
 for _d in (RAW_CSV_DIR, CATALOG_DIR, OUTPUT_DIR, CHECKPOINT_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# STAGE 1 SETTINGS — same defaults as the old script (uto_ligo_analysis.py),
+# carried across unchanged. Only changeable via advanced settings later.
+# ---------------------------------------------------------------------
+GLITCH_CLASSES = [
+    "Blip", "Koi_Fish", "Tomte", "Helix",
+    "Extremely_Loud", "Repeating_Blips", "Paired_Doves",
+]  # only genuinely unexplained-cause classes
+
+ML_CONFIDENCE_MIN = 0.9
+COINCIDENCE_WINDOW_MS = 15  # H1-L1 light travel time ~10ms; padded
+
+# Approximate public start/end GPS times for each LIGO/Virgo observing
+# run (same table as the old script — verify against GWOSC before
+# treating run boundaries as authoritative:
+# https://gwosc.org/eventapi/html/O3_Discovery_Papers/)
+RUN_GPS_WINDOWS = {
+    "O1":  (1126051217, 1137254417),
+    "O2":  (1164556817, 1187733618),
+    "O3a": (1238166018, 1253977218),
+    "O3b": (1256655618, 1269363618),
+}
+
+_RUN_LABEL_RE = re.compile(r"([OoSs])(\d+)([a-cA-C]?)")
+
+
+def _extract_run_label(filename):
+    """Pulls an observing-run label (O1, O2, O3a, ...) out of a raw CSV's
+    filename, matching the casing used in RUN_GPS_WINDOWS's keys. Falls
+    back to the filename stem if no such pattern is found."""
+    m = _RUN_LABEL_RE.search(filename)
+    if m:
+        return m.group(1).upper() + m.group(2) + m.group(3).lower()
+    return os.path.splitext(filename)[0]
+
+
+def assign_observing_run(gps_time):
+    """Labels a GPS time with which observing run it falls in, or
+    'unknown' if outside all known run windows."""
+    for run, (start, end) in RUN_GPS_WINDOWS.items():
+        if start <= gps_time <= end:
+            return run
+    return "unknown"
 
 
 # ---------------------------------------------------------------------
@@ -190,16 +238,249 @@ def make_run_output_dir(folder_name):
 
 
 # ---------------------------------------------------------------------
-# STAGES — full menu shown from day one (per the context doc), even
-# though most of these are empty right now. Build order will NOT
-# match this numbering (Stage 3/4 first, per the plan) — this list is
-# just the reference menu, not the build order.
+# RUN SELECTION — now real. Lists runs found in RAW_CSV_DIR (by
+# scanning filenames for an O1/O2/O3a-style label), picks by number,
+# comma-list, or "all". Enter defaults to all.
 # ---------------------------------------------------------------------
+def get_available_runs():
+    """Scans RAW_CSV_DIR for raw Gravity Spy CSVs and returns
+    (sorted run labels found, the matching filenames). Returns
+    ([], []) if the folder has no CSVs yet."""
+    if not RAW_CSV_DIR.exists():
+        return [], []
+    files = sorted(f for f in os.listdir(RAW_CSV_DIR) if f.lower().endswith(".csv"))
+    labels = sorted({_extract_run_label(fn) for fn in files})
+    return labels, files
+
+
+def prompt_run_selection():
+    """Lists every run label found in raw_csvs/ and asks which to use.
+    Accepts a single number, a comma-separated list of numbers, or
+    'all'. Enter (no input) defaults to all. Returns a list of run
+    labels, e.g. ['O1'] or ['O1', 'O2']."""
+    labels, files = get_available_runs()
+
+    if not labels:
+        print(f"\nNo raw CSV files found in:\n  {RAW_CSV_DIR}")
+        print("Nothing to select — Stage 1 will have nothing to load.")
+        return []
+
+    print("\nRuns found in raw_csvs/:")
+    for i, label in enumerate(labels, start=1):
+        print(f"  {i}. {label}")
+
+    raw = input(
+        f"\nPick run(s) by number or name (like 1,3a), or Enter for all "
+        f"[{', '.join(labels)}]: "
+    ).strip()
+
+    if not raw or raw.lower() == "all":
+        return labels
+
+    chosen = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(labels):
+                chosen.append(labels[idx])
+            else:
+                print(f"  '{part}' is out of range — ignoring.")
+        except ValueError:
+            # not a plain number, so treat it as a run name like 3a or O3a
+            wanted = part.lower().lstrip("o")
+            matches = [lab for lab in labels if lab.lower().lstrip("o") == wanted]
+            if matches:
+                chosen.append(matches[0])
+            else:
+                print(f"  '{part}' is not a run I found — ignoring.")
+
+    if not chosen:
+        print("Nothing valid selected — defaulting to all runs.")
+        return labels
+
+    # de-duplicate while keeping the order the user typed them in
+    seen = set()
+    ordered = []
+    for label in chosen:
+        if label not in seen:
+            seen.add(label)
+            ordered.append(label)
+    return ordered
+
+
+# ---------------------------------------------------------------------
+# STAGE 1 — Load glitch catalog + filter to single-detector events.
+# Mirrors uto_ligo_analysis.py's Steps 1-2, but reads only the CSV
+# files that match the selected run(s) instead of every CSV in the
+# folder — that's what makes run selection actually do something.
+# ---------------------------------------------------------------------
+def fetch_glitch_catalog_from_files(
+    csv_files, gps_start, gps_end,
+    detectors=("H1", "L1", "V1"),
+    ml_confidence_min=ML_CONFIDENCE_MIN,
+):
+    """
+    Loads the given raw Gravity Spy CSVs (from RAW_CSV_DIR) and
+    filters down to:
+      - gps_time within [gps_start, gps_end] (skipped if either is None)
+      - detector in `detectors`
+      - ml_confidence >= ml_confidence_min
+      - ml_label in GLITCH_CLASSES (the 7 unexplained-cause classes)
+
+    Returns a DataFrame with columns:
+        ['gps_time', 'detector', 'ml_label', 'ml_confidence',
+         'snr', 'peak_frequency', 'duration', 'gravityspy_id']
+    (only the ones actually present in the source CSVs).
+    """
+    frames = []
+    for fname in csv_files:
+        frames.append(pd.read_csv(RAW_CSV_DIR / fname))
+
+    if not frames:
+        raise FileNotFoundError(
+            f"No matching CSV files found in {RAW_CSV_DIR} for the "
+            f"selected run(s)."
+        )
+
+    raw = pd.concat(frames, ignore_index=True)
+    raw = raw.rename(columns={"event_time": "gps_time", "ifo": "detector"})
+    if "gps_time" not in raw.columns and "peak_time" in raw.columns:
+        raw["gps_time"] = raw["peak_time"]
+
+    required_cols = {"gps_time", "detector", "ml_label", "ml_confidence"}
+    missing = required_cols - set(raw.columns)
+    if missing:
+        raise ValueError(
+            f"Loaded data is missing expected columns: {missing}. "
+            f"Available columns: {list(raw.columns)}"
+        )
+
+    df = raw
+    if gps_start is not None and gps_end is not None:
+        df = df[(df["gps_time"] >= gps_start) & (df["gps_time"] <= gps_end)]
+    df = df[df["detector"].isin(detectors)]
+    df = df[df["ml_confidence"] >= ml_confidence_min]
+    if GLITCH_CLASSES:
+        df = df[df["ml_label"].isin(GLITCH_CLASSES)]
+
+    keep_cols = [c for c in
+                 ["gps_time", "detector", "ml_label", "ml_confidence",
+                  "snr", "peak_frequency", "duration", "gravityspy_id"]
+                 if c in df.columns]
+    df = df[keep_cols].sort_values("gps_time").reset_index(drop=True)
+
+    print(f"Loaded {len(df)} glitches after filtering "
+          f"(confidence >= {ml_confidence_min}, classes={GLITCH_CLASSES})")
+
+    return df
+
+
+def filter_single_detector_events(df, window_ms=COINCIDENCE_WINDOW_MS):
+    """
+    Keeps only events where no OTHER detector has a listed trigger
+    within +/- window_ms of the same gps_time. Identical logic to the
+    old script's version.
+    """
+    window_s = window_ms / 1000.0
+    keep_rows = []
+    times = df["gps_time"].values
+    dets = df["detector"].values
+
+    for i, (t, d) in enumerate(zip(times, dets)):
+        others = df[
+            (df["detector"] != d) &
+            (abs(df["gps_time"] - t) <= window_s)
+        ]
+        if others.empty:
+            keep_rows.append(i)
+
+    return df.iloc[keep_rows].reset_index(drop=True)
+
 
 def stage_1_load_and_filter(run_context):
-    print("[Stage 1 - Load and filter events — not built yet, skipping]")
-    return None
+    """
+    Loads the raw glitch CSVs for the selected run(s), filters to
+    single-detector-only events, and stores both DataFrames plus the
+    combined GPS window in run_context for later stages to use.
 
+    Checkpoints are tagged by the combined run selection (e.g. "O1"
+    or "O1_O2"), same pattern as the old script's data-pool tagging.
+    """
+    selected_runs = run_context.get("selected_runs") or []
+    if not selected_runs:
+        print("No runs selected — Stage 1 has nothing to load.")
+        return None
+
+    all_labels, all_files = get_available_runs()
+    matching_files = [f for f in all_files if _extract_run_label(f) in selected_runs]
+    if not matching_files:
+        print(f"No CSV files in {RAW_CSV_DIR} match the selected run(s) "
+              f"{selected_runs}.")
+        return None
+
+    known_runs = [r for r in selected_runs if r in RUN_GPS_WINDOWS]
+    unknown_runs = [r for r in selected_runs if r not in RUN_GPS_WINDOWS]
+    if unknown_runs:
+        print(f"WARNING: run label(s) {unknown_runs} not found in "
+              f"RUN_GPS_WINDOWS — add them there if you want their "
+              f"events properly windowed.")
+    gps_start = min(RUN_GPS_WINDOWS[r][0] for r in known_runs) if known_runs else None
+    gps_end = max(RUN_GPS_WINDOWS[r][1] for r in known_runs) if known_runs else None
+
+    run_tag = "_".join(sorted(selected_runs))
+    print(f"\nStage 1: selected run(s) = {selected_runs}  |  tag = '{run_tag}'  |  "
+          f"GPS window = {gps_start} - {gps_end}")
+    print(f"Matching CSV file(s): {', '.join(matching_files)}")
+
+    # --- Step 1: load + filter glitch catalog ---
+    glitches = load_checkpoint("01_glitches", tag=run_tag)
+    action = prompt_step_action("Stage 1 - load glitch catalog", has_checkpoint=(glitches is not None))
+    if action == "checkpoint":
+        print(f"   -> using checkpoint ({len(glitches)} events, skipped re-load)")
+    elif action == "skip":
+        print("   -> SKIPPED for this run.")
+        glitches = None
+    else:
+        glitches = fetch_glitch_catalog_from_files(matching_files, gps_start, gps_end)
+        save_checkpoint("01_glitches", glitches, tag=run_tag)
+
+    if glitches is None or len(glitches) == 0:
+        print("No glitches available — Stage 1 stops here for this run.")
+        run_context["glitches"] = glitches
+        run_context["single_det"] = None
+        return None
+
+    # --- Step 2: filter to single-detector-only events ---
+    single_det = load_checkpoint("02_single_det", tag=run_tag)
+    action2 = prompt_step_action("Stage 1 - filter to single-detector events", has_checkpoint=(single_det is not None))
+    if action2 == "checkpoint":
+        print(f"   -> using checkpoint ({len(single_det)} single-detector events, skipped re-filter)")
+    elif action2 == "skip":
+        print("   -> SKIPPED for this run.")
+        single_det = None
+    else:
+        single_det = filter_single_detector_events(glitches)
+        single_det["observing_run"] = single_det["gps_time"].apply(assign_observing_run)
+        print(f"   -> {len(single_det)} single-detector events found")
+        save_checkpoint("02_single_det", single_det, tag=run_tag)
+
+    run_context["glitches"] = glitches
+    run_context["single_det"] = single_det
+    run_context["gps_start"] = gps_start
+    run_context["gps_end"] = gps_end
+    run_context["run_tag"] = run_tag
+
+    return single_det
+
+
+# ---------------------------------------------------------------------
+# STAGES 2-10 — still stubs. Build order runs in actual pipeline
+# order now (Stage 1 first, as just built above), not the "Stage 3/4
+# first" order mentioned earlier in the design doc.
+# ---------------------------------------------------------------------
 
 def stage_2_pointing_and_weight(run_context):
     print("[Stage 2 - Pointing and antenna weight — not built yet, skipping]")
@@ -264,27 +545,18 @@ STAGES = [
 
 
 # ---------------------------------------------------------------------
-# RUN SELECTION — stub. Will list runs found in RAW_CSV_DIR, pick by
-# number / comma-list / "all" (Enter = all).
-# ---------------------------------------------------------------------
-def prompt_run_selection():
-    print("[Run selection prompt — not built yet, skipping. Using 'all' as a placeholder.]")
-    return "all"
-
-
-# ---------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------
 def main():
     print("=" * 70)
-    print("UTO v2 — SKELETON BUILD")
+    print("UTO v2 — BUILD IN PROGRESS")
     print("=" * 70)
 
     check_venv_active()
+    ask_network_permission()
     first_time_setup_check()
 
     selected_runs = prompt_run_selection()
-    ask_network_permission()
 
     run_context = {
         "selected_runs": selected_runs,
@@ -296,8 +568,8 @@ def main():
         print(f"\n--- {label} ---")
         func(run_context)
 
-    print("\nSkeleton run complete. No real analysis done yet.")
-    print("Next: copy real code into one stage function at a time, test, repeat.")
+    print("\nRun complete.")
+    print("Next: copy real code into the next stub stage, test, repeat.")
 
 
 if __name__ == "__main__":
