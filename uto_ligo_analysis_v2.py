@@ -60,6 +60,14 @@ GLITCH_CLASSES = [
 
 ML_CONFIDENCE_MIN = 0.9
 COINCIDENCE_WINDOW_MS = 15  # H1-L1 light travel time ~10ms; padded
+DETECTOR_LOCATIONS = {
+    "H1": (46.4551, -119.4077, 142.6),
+    "L1": (30.5629, -90.7742, -6.6),
+    "V1": (43.6314, 10.5045, 51.9),
+}
+ 
+POINTING_CHUNK_SIZE = 5000        # events converted per astropy call (memory limit)
+ZENITH_DEC_TOLERANCE_DEG = 0.5    # how far a zenith Dec may stray from the detector's latitude
 
 # Approximate public start/end GPS times for each LIGO/Virgo observing
 # run (same table as the old script — verify against GWOSC before
@@ -105,8 +113,16 @@ def check_venv_active():
     if not in_venv:
         print("=" * 70)
         print("STOP: no virtual environment is active.")
-        print("Activate it first, e.g.:")
+        print()
+        print("First time here? Run these from the project folder, one at a time:")
+        print("    python3 -m venv ligo-env")
         print("    source ligo-env/bin/activate")
+        print("    pip install numpy pandas astropy astroquery pycbc")
+        print("(pycbc is the largest download and can take a while.)")
+        print()
+        print("Already set up? Just activate it, then run this script again:")
+        print("    source ligo-env/bin/activate")
+        print()
         print("=" * 70)
         sys.exit(1)
     print(f"Virtual environment OK ({sys.prefix})")
@@ -482,9 +498,102 @@ def stage_1_load_and_filter(run_context):
 # first" order mentioned earlier in the design doc.
 # ---------------------------------------------------------------------
 
-def stage_2_pointing_and_weight(run_context):
-    print("[Stage 2 - Pointing and antenna weight — not built yet, skipping]")
-    return None
+def compute_pointing_batch(detectors, gps_times):
+    """Turns 'straight up from this detector at this GPS time' into
+    sky coordinates (RA/Dec), for many events in one astropy call.
+    Returns a SkyCoord array in ICRS, same length as the inputs.
+ 
+    Astropy is imported here, inside the function, so the script's
+    friendly environment-check message still appears first on a
+    machine that does not have the packages installed yet."""
+    import numpy as np
+    import astropy.units as u
+    from astropy.coordinates import EarthLocation, AltAz, SkyCoord
+    from astropy.time import Time
+ 
+    detectors = np.asarray(detectors)
+    lats = np.array([DETECTOR_LOCATIONS[d][0] for d in detectors])
+    lons = np.array([DETECTOR_LOCATIONS[d][1] for d in detectors])
+    heights = np.array([DETECTOR_LOCATIONS[d][2] for d in detectors])
+ 
+    locations = EarthLocation(lat=lats * u.deg, lon=lons * u.deg, height=heights * u.m)
+    times = Time(np.asarray(gps_times, dtype=float), format="gps")
+    zenith = AltAz(alt=90 * u.deg, az=0 * u.deg, location=locations, obstime=times)
+    return SkyCoord(zenith).icrs
+ 
+ 
+def report_pointing_sanity(pointing):
+    """Free sanity check. A detector's zenith only sweeps a ring of sky
+    at its own latitude, so each detector's Dec should stay close to
+    that latitude (H1 about 46.5, L1 about 30.6). Also checks nothing
+    came out empty (NaN)."""
+    print("\nPointing sanity check (zenith Dec should sit near each detector's latitude):")
+    all_ok = True
+    for det in sorted(pointing["detector"].unique()):
+        rows = pointing[pointing["detector"] == det]
+        lat = DETECTOR_LOCATIONS[det][0]
+        low, high = rows["dec"].min(), rows["dec"].max()
+        ok = (abs(low - lat) <= ZENITH_DEC_TOLERANCE_DEG
+              and abs(high - lat) <= ZENITH_DEC_TOLERANCE_DEG)
+        all_ok = all_ok and ok
+        print(f"  {det}: {len(rows)} events | Dec {low:.2f} to {high:.2f} "
+              f"| detector latitude {lat:.2f} | {'OK' if ok else '*** CHECK THIS ***'}")
+    n_bad = int(pointing[["ra", "dec"]].isna().any(axis=1).sum())
+    if n_bad:
+        all_ok = False
+        print(f"  *** WARNING: {n_bad} event(s) have an empty RA or Dec. ***")
+    if all_ok:
+        print("  All detectors pass.")
+    else:
+        print("  Something looks wrong - do not build Stage 3 on this until it is understood.")
+ 
+ 
+def stage_2_pointing(run_context):
+    """Adds zenith 'ra' and 'dec' columns (degrees) to a copy of the
+    single-detector table, in chunks with progress printed. Result goes
+    to run_context['pointing'] and is checkpointed per run selection."""
+    import time
+    import numpy as np
+ 
+    single_det = run_context.get("single_det")
+    if single_det is None or len(single_det) == 0:
+        print("Stage 2 needs the single-detector events from Stage 1, and none "
+              "are available - skipping.")
+        return None
+    run_tag = run_context["run_tag"]
+ 
+    pointing = load_checkpoint("03_pointing", tag=run_tag)
+    action = prompt_step_action("Stage 2 - pointing", has_checkpoint=(pointing is not None))
+ 
+    if action == "checkpoint":
+        print(f"   -> using checkpoint ({len(pointing)} events, skipped recompute)")
+    elif action == "skip":
+        print("   -> SKIPPED for this run.")
+        pointing = None
+    else:
+        n_events = len(single_det)
+        detectors = single_det["detector"].values
+        gps_times = single_det["gps_time"].values.astype(float)
+        ra = np.empty(n_events)
+        dec = np.empty(n_events)
+ 
+        clock = time.time()
+        for start in range(0, n_events, POINTING_CHUNK_SIZE):
+            end = min(start + POINTING_CHUNK_SIZE, n_events)
+            coords = compute_pointing_batch(detectors[start:end], gps_times[start:end])
+            ra[start:end] = coords.ra.deg
+            dec[start:end] = coords.dec.deg
+            print(f"   pointing {end}/{n_events} done ({time.time() - clock:.1f}s elapsed)")
+ 
+        pointing = single_det.copy()
+        pointing["ra"] = ra
+        pointing["dec"] = dec
+        save_checkpoint("03_pointing", pointing, tag=run_tag)
+ 
+    if pointing is not None:
+        run_context["pointing"] = pointing
+        report_pointing_sanity(pointing)
+    return pointing
 
 
 def stage_3_galaxy_star_lookup(run_context):
@@ -532,7 +641,7 @@ def stage_10_cross_run_replication(run_context):
 
 STAGES = [
     ("Stage 1 - Load and filter events", stage_1_load_and_filter),
-    ("Stage 2 - Pointing and antenna weight", stage_2_pointing_and_weight),
+    ("Stage 2 - Pointing", stage_2_pointing),
     ("Stage 3 - Galaxy and star lookup", stage_3_galaxy_star_lookup),
     ("Stage 4 - Star-galaxy pairs and deep-check tags", stage_4_pairs_and_tiers),
     ("Stage 5 - Diagnostics", stage_5_diagnostics),
